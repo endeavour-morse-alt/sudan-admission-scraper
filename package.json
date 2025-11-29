@@ -1,0 +1,13 @@
+{
+  "name": "sudan-admission-scraper-2024",
+  "version": "1.0.0",
+  "description": "Scrapes Sudan 2024 university admission results at scale",
+  "main": "scraper.js",
+  "scripts": {
+    "start": "node scraper.js"
+  },
+  "dependencies": {
+    "puppeteer": "^24.31.0"
+  },
+  "license": "MIT"
+}
