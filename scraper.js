@@ -1,56 +1,68 @@
 const fs = require('fs');
 const puppeteer = require('puppeteer');
 
-// عدد المتصفحات المتزامنة (يمكنك تعديله حسب قوة جهازك واتصال الإنترنت)
-const CONCURRENCY = 8;
-// نطاق الأرقام
+const CONCURRENCY = 6; // مثالي لـ 8GB RAM (خاصة على Codespaces)
 const START = 11030000;
 const END = 11070000;
 
-// دالة معالجة رقم واحد
 async function processNumber(browser, num) {
     const page = await browser.newPage();
     try {
-        // تحميل الصفحة (بدون انتظار كامل — فقط load يكفي للسرعة)
+        // ✅ إصلاح الرابط: إزالة المسافات الزائدة
         await page.goto('https://daleel.admission.gov.sd/result2024/Result_2024.aspx', {
-            waitUntil: 'load',
-            timeout: 8000
+            waitUntil: 'domcontentloaded',
+            timeout: 10000
         });
 
-        // تعيين القيمة مباشرة عبر evaluate (أسرع من type)
         await page.evaluate((num) => {
-            document.querySelector('#TextBox1').value = num;
+            const input = document.querySelector('#TextBox1');
+            if (input) input.value = num;
         }, num.toString());
 
-        // النقر وانتظار النتيجة بأسرع طريقة
-        await Promise.all([
-            page.click('#Button1'),
-            page.waitForNavigation({ waitUntil: 'load', timeout: 8000 })
+        const response = await Promise.race([
+            page.click('#Button1').then(() => page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 12000 })),
+            new Promise(resolve => setTimeout(resolve, 13000))
         ]);
 
-        // استخراج النتيجة
-        const rows = await page.$$('#GridView1 tr');
-        if (rows.length > 1) {
-            const tds = await rows[1].$$('td');
-            if (tds.length >= 2) {
-                const name = await tds[0].evaluate(el => el.textContent.trim());
-                const college = await tds[1].evaluate(el => el.textContent.trim());
-                if (name && name !== '' && name !== '&nbsp;' && name !== '\xa0') {
-                    await page.close();
-                    return { number: num, name, college };
-                }
+        if (!response) {
+            await page.close();
+            return { number: num, name: "خطأ: انتهاء المهلة", college: "خطأ" };
+        }
+
+        // ✅ التحقق الآمن: هل هناك جدول نتائج؟
+        const hasResultTable = await page.$('table[summary="Result"]') || await page.$('#GridView1') || await page.$('table');
+
+        if (!hasResultTable) {
+            await page.close();
+            return { number: num, name: "لا توجد", college: "لا توجد" };
+        }
+
+        // ✅ محاولة استخراج من الصف الثاني من أول جدول
+        const firstRowTexts = await page.$$eval('table tr:nth-child(2) td', tds => 
+            tds.map(td => td.textContent.trim())
+        );
+
+        if (firstRowTexts.length >= 2) {
+            const name = firstRowTexts[0];
+            const college = firstRowTexts[1];
+            if (name && name !== '' && !name.includes('لا توجد') && !name.includes('غير موجود')) {
+                await page.close();
+                return { number: num, name, college };
             }
         }
+
         await page.close();
         return { number: num, name: "لا توجد", college: "لا توجد" };
 
     } catch (err) {
         await page.close();
-        return { number: num, name: "خطأ", college: "خطأ" };
+        return { number: num, name: `خطأ: ${err.message}`, college: "خطأ" };
     }
 }
 
 (async () => {
+    console.log(`🚀 بدء المعالجة من ${START} إلى ${END} (العدد: ${END - START + 1})`);
+
     const browser = await puppeteer.launch({
         headless: true,
         executablePath: '/usr/bin/chromium-browser',
@@ -59,40 +71,37 @@ async function processNumber(browser, num) {
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
             '--disable-gpu',
-            '--single-process' // قد يُسرّع على بعض الخوادم
+            '--disable-features=site-per-process'
         ]
     });
 
-    const results = [];
     const total = END - START + 1;
+    let completed = 0;
 
-    // دالة لحفظ النتائج فور توفرها
     const saveResult = (result) => {
-        results.push(result);
-        // كتابة مباشرة (بدون انتظار) — غير فعّال للقراءة لكن سريع للكتابة
         fs.appendFileSync('results_fast.jsonl', JSON.stringify(result) + '\n', 'utf-8');
-        if (results.length % 50 === 0) {
-            console.log(`✅ أنهى: ${results.length} / ${total}`);
+        completed++;
+        if (completed % 100 === 0) {
+            console.log(`✅ ${completed} / ${total} | الوقت: ${new Date().toLocaleTimeString()}`);
         }
     };
 
-    // تشغيل المهام بالتوازي
     const numbers = Array.from({ length: total }, (_, i) => START + i);
-    const promises = [];
 
     for (let i = 0; i < numbers.length; i += CONCURRENCY) {
         const batch = numbers.slice(i, i + CONCURRENCY);
-        const batchPromises = batch.map(num => processNumber(browser, num).then(saveResult));
-        await Promise.all(batchPromises);
+        const promises = batch.map(num => processNumber(browser, num).then(saveResult));
+        await Promise.all(promises);
     }
 
-    // تحويل JSONL إلى JSON كامل (اختياري في النهاية)
-    const finalResults = fs.readFileSync('results_fast.jsonl', 'utf-8')
+    // دمج الملف النهائي
+    const lines = fs.readFileSync('results_fast.jsonl', 'utf-8')
         .split('\n')
-        .filter(line => line.trim())
-        .map(line => JSON.parse(line));
+        .filter(line => line.trim());
+    const results = lines.map(line => JSON.parse(line));
 
-    fs.writeFileSync('results_fast_final.json', JSON.stringify(finalResults, null, 2), 'utf-8');
+    fs.writeFileSync('results_fast_final.json', JSON.stringify(results, null, 2), 'utf-8');
     await browser.close();
-    console.log('🚀 الانتهاء! النتائج في results_fast_final.json');
+
+    console.log(`🎉 الانتهاء! تم حفظ ${results.length} نتيجة في results_fast_final.json`);
 })();
